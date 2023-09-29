@@ -35,6 +35,9 @@ var (
 	// ErrDeviceNotFound is returned when a call cannot find a device.
 	ErrDeviceNotFound = errors.New("device not found")
 
+	// ErrPropertyBusy is returned when the client tries to change a busy property.
+	ErrPropertyStateBusy = errors.New("Tried to set a busy property")
+
 	// ErrPropertyNotFound is returned when a call cannot find a property.
 	ErrPropertyNotFound = errors.New("property not found")
 
@@ -49,6 +52,9 @@ var (
 
 	// ErrInvalidBlobEnable is returned when a value other than Only, Also, Never is specified for BlobEnable.
 	ErrInvalidBlobEnable = errors.New("invalid BlobEnable value")
+
+	// ErrBlobNotFound is returned when an attempt to read a blob value is made but none are found
+	ErrBlobNotFound = errors.New("blob not found")
 )
 
 // PropertyState represents the current state of a property. "Idle", "Ok", "Busy", or "Alert".
@@ -135,8 +141,10 @@ type INDIClient struct {
 
 	write chan interface{}
 	read  chan interface{}
+	writeReturn chan error
 
-	devices     sync.Map
+	rwm         *sync.RWMutex //Protects devices structure
+	devices     map[string]Device
 	blobStreams sync.Map
 }
 
@@ -145,10 +153,11 @@ func NewINDIClient(log logging.Logger, dialer Dialer, fs afero.Fs, bufferSize in
 	return &INDIClient{
 		log:         log,
 		dialer:      dialer,
-		devices:     sync.Map{},
+		devices:     make(map[string]Device),
 		blobStreams: sync.Map{},
 		fs:          fs,
 		bufferSize:  bufferSize,
+		rwm:         &sync.RWMutex{},
 	}
 }
 
@@ -160,12 +169,13 @@ func (c *INDIClient) Connect(network, address string) error {
 	}
 
 	// Clear out all devices
+	c.rwm.Lock()
 	c.delProperty(&DelProperty{})
-
+	c.rwm.Unlock()
 	c.conn = conn
 
 	c.read = make(chan interface{}, c.bufferSize)
-	c.write = make(chan interface{}, c.bufferSize)
+	c.write = make(chan interface{}, c.bufferSize) 
 
 	c.startRead()
 	c.startWrite()
@@ -176,7 +186,9 @@ func (c *INDIClient) Connect(network, address string) error {
 // Disconnect clears out all devices from memory, closes the connection, and closes the read and write channels.
 func (c *INDIClient) Disconnect() error {
 	// Clear out all devices
+	c.rwm.Lock()
 	c.delProperty(&DelProperty{})
+	c.rwm.Unlock()
 
 	if c.conn == nil {
 		return nil
@@ -208,20 +220,24 @@ func (c *INDIClient) IsConnected() bool {
 }
 
 // Devices returns the current list of INDI devices with their current state.
-func (c *INDIClient) Devices() []Device {
-	devices := []Device{}
+func (c *INDIClient) Devices() []string {
+	c.rwm.RLock()
+	defer c.rwm.RUnlock()
+	devices := []string{}
 
-	c.devices.Range(func(key, value interface{}) bool {
-		devices = append(devices, value.(Device))
-
-		return true
-	})
+	for key, _ := range c.devices {
+		devices = append(devices, key)
+		return devices
+	}
 
 	return devices
 }
 
 // GetBlob finds a BLOB with the given deviceName, propName, blobName. Be sure to close rdr when you are done with it.
 func (c *INDIClient) GetBlob(deviceName, propName, blobName string) (rdr io.ReadCloser, fileName string, length int64, err error) {
+	c.rwm.Lock()
+	defer c.rwm.Unlock()
+
 	device, err := c.findDevice(deviceName)
 	if err != nil {
 		return
@@ -239,6 +255,11 @@ func (c *INDIClient) GetBlob(deviceName, propName, blobName string) (rdr io.Read
 		return
 	}
 
+	if val.Size == 0 || val.Name == "" {
+		err = ErrBlobNotFound
+		return
+	}
+
 	rdr, err = c.fs.Open(val.Value)
 	if err != nil {
 		return
@@ -247,13 +268,44 @@ func (c *INDIClient) GetBlob(deviceName, propName, blobName string) (rdr io.Read
 	fileName = filepath.Base(val.Value)
 
 	length = val.Size
+	// This method should only work once per blob, so the blob value and size are reset
+	val.Value = ""
+	val.Size = 0
 	return
+}
+
+func (c *INDIClient) BlobAvailable(deviceName, propName, blobName string) bool {
+	c.rwm.RLock()
+	defer c.rwm.RUnlock()
+
+	device, err := c.findDevice(deviceName)
+	if err != nil {
+		return false
+	}
+
+	prop, ok := device.BlobProperties[propName]
+	if !ok {
+		return false
+	}
+
+	val, ok := prop.Values[blobName]
+	if !ok {
+		return false
+	}
+
+	if val.Size == 0 || val.Name == "" {
+		return false
+	}
+
+	return true
 }
 
 // GetBlobStream finds a BLOB with the given deviceName, propName, blobName. This will return an io.Pipe that can stream the BLOBs that are received from the indiserver.
 // The client will keep track of all open streams and write to them as blobs are received from indiserver. Remember to call CloseBlobStream when you are done. If you don't,
 // all blobs received for that device, property, blob will fail to write once the reader is closed.
 func (c *INDIClient) GetBlobStream(deviceName, propName, blobName string) (rdr io.ReadCloser, id string, err error) {
+	c.rwm.RLock()
+	defer c.rwm.RUnlock()
 	device, err := c.findDevice(deviceName)
 	if err != nil {
 		return
@@ -295,6 +347,8 @@ func (c *INDIClient) GetBlobStream(deviceName, propName, blobName string) (rdr i
 
 // CloseBlobStream closes the blob stream created by GetBlobStream.
 func (c *INDIClient) CloseBlobStream(deviceName, propName, blobName string, id string) (err error) {
+	c.rwm.RLock()
+	defer c.rwm.RUnlock()
 	device, err := c.findDevice(deviceName)
 	if err != nil {
 		return
@@ -346,6 +400,75 @@ func (c *INDIClient) GetProperties(deviceName, propName string) error {
 	return nil
 }
 
+func (c *INDIClient) TextPropertySet(deviceName, propName string) bool {
+	c.rwm.RLock()
+	defer c.rwm.RUnlock()
+	device, err := c.findDevice(deviceName)
+	if err != nil {
+		return false
+	}
+
+	_, ok := device.TextProperties[propName]
+	if !ok {
+		return false
+	}
+
+	return true
+	
+}
+
+func (c *INDIClient) NumberPropertySet(deviceName, propName string) bool {
+	fmt.Println("before lock")
+	c.rwm.RLock()
+	defer c.rwm.RUnlock()
+	fmt.Println("lock aquired")
+	device, err := c.findDevice(deviceName)
+	if err != nil {
+		fmt.Println("no device")
+		return false
+	}
+
+	_, ok := device.NumberProperties[propName]
+	if !ok {
+		fmt.Println("no prop")
+		return false
+	}
+	fmt.Println("made it through")
+	return true
+}
+
+func (c *INDIClient) SwitchPropertySet(deviceName, propName string) bool {
+	c.rwm.RLock()
+	defer c.rwm.RUnlock()
+	device, err := c.findDevice(deviceName)
+	if err != nil {
+		return false
+	}
+
+	_, ok := device.SwitchProperties[propName]
+	if !ok {
+		return false
+	}
+
+	return true
+}
+
+func (c *INDIClient) BlobPropertySet(deviceName, propName string) bool {
+	c.rwm.RLock()
+	defer c.rwm.RUnlock()
+	device, err := c.findDevice(deviceName)
+	if err != nil {
+		return false
+	}
+
+	_, ok := device.BlobProperties[propName]
+	if !ok {
+		return false
+	}
+
+	return true
+}
+
 // EnableBlob sends a command to the INDI server to enable/disable BLOBs for the current connection.
 // It is recommended to enable blobs on their own client, and keep the main connection clear of large transfers.
 // By default, BLOBs are NOT enabled.
@@ -371,31 +494,42 @@ func (c *INDIClient) EnableBlob(deviceName, propName string, val BlobEnable) err
 }
 
 // SetTextValue sends a command to the INDI server to change the value of a textVector.
+// Waits to return until the state of the vector is ok.
 func (c *INDIClient) SetTextValue(deviceName, propName, textName, textValue string) error {
+	c.rwm.Lock()
 	device, err := c.findDevice(deviceName)
 	if err != nil {
+		c.rwm.Unlock()
 		return err
 	}
 
 	prop, ok := device.TextProperties[propName]
 	if !ok {
+		c.rwm.Unlock()
 		return ErrPropertyNotFound
 	}
 
+	if prop.State == PropertyStateBusy {
+		c.rwm.Unlock()
+		return ErrPropertyStateBusy
+	}
+
 	if prop.Permissions == PropertyPermissionReadOnly {
+		c.rwm.Unlock()
 		return ErrPropertyReadOnly
 	}
 
 	_, ok = prop.Values[textName]
 	if !ok {
+		c.rwm.Unlock()
 		return ErrPropertyValueNotFound
 	}
 
 	prop.State = PropertyStateBusy
-
+	
 	device.TextProperties[propName] = prop
 
-	c.devices.Store(deviceName, device)
+	c.devices[deviceName] = device
 
 	cmd := NewTextVector{
 		Device: deviceName,
@@ -408,29 +542,51 @@ func (c *INDIClient) SetTextValue(deviceName, propName, textName, textValue stri
 		},
 	}
 
+	c.rwm.Unlock()
+
 	c.write <- cmd
+	
+	for {
+		c.rwm.RLock()
+		if c.devices[deviceName].TextProperties[propName].State == PropertyStateOk {
+			c.rwm.RUnlock()
+			break
+		}
+		c.rwm.RUnlock()
+		
+	}
 
 	return nil
 }
 
 // SetNumberValue sends a command to the INDI server to change the value of a numberVector.
-func (c *INDIClient) SetNumberValue(deviceName, propName, NumberName, NumberValue string) error {
+func (c *INDIClient) SetNumberValue(deviceName, propName, numberName, numberValue string) error {
+	c.rwm.Lock()
 	device, err := c.findDevice(deviceName)
 	if err != nil {
+		c.rwm.Unlock()
 		return err
 	}
 
 	prop, ok := device.NumberProperties[propName]
 	if !ok {
+		c.rwm.Unlock()
 		return ErrPropertyNotFound
 	}
 
+	if prop.State == PropertyStateBusy {
+		c.rwm.Unlock()
+		return ErrPropertyStateBusy
+	}
+
 	if prop.Permissions == PropertyPermissionReadOnly {
+		c.rwm.Unlock()
 		return ErrPropertyReadOnly
 	}
 
-	_, ok = prop.Values[NumberName]
+	_, ok = prop.Values[numberName]
 	if !ok {
+		c.rwm.Unlock()
 		return ErrPropertyValueNotFound
 	}
 
@@ -438,20 +594,29 @@ func (c *INDIClient) SetNumberValue(deviceName, propName, NumberName, NumberValu
 
 	device.NumberProperties[propName] = prop
 
-	c.devices.Store(deviceName, device)
-
+	c.devices[deviceName] = device
+	
 	cmd := NewNumberVector{
 		Device: deviceName,
 		Name:   propName,
 		Numbers: []OneNumber{
 			{
-				Name:  NumberName,
-				Value: NumberValue,
+				Name:  numberName,
+				Value: numberValue,
 			},
 		},
 	}
-
+	c.rwm.Unlock()
 	c.write <- cmd
+
+	for {
+		c.rwm.RLock()
+		if c.devices[deviceName].NumberProperties[propName].State == PropertyStateOk {
+			c.rwm.RUnlock()
+			break
+		}
+		c.rwm.RUnlock()
+	}
 
 	return nil
 }
@@ -460,6 +625,8 @@ func (c *INDIClient) SetNumberValue(deviceName, propName, NumberName, NumberValu
 // Note that you will ususally set the desired property on SwitchStateOn, and let the device
 // decide how to switch the other values off.
 func (c *INDIClient) SetSwitchValue(deviceName, propName, switchName string, switchValue SwitchState) error {
+	c.rwm.Lock()
+	fmt.Println("lock aquired")
 	device, err := c.findDevice(deviceName)
 	if err != nil {
 		return err
@@ -467,15 +634,23 @@ func (c *INDIClient) SetSwitchValue(deviceName, propName, switchName string, swi
 
 	prop, ok := device.SwitchProperties[propName]
 	if !ok {
+		c.rwm.Unlock()
 		return ErrPropertyNotFound
 	}
 
+	if prop.State == PropertyStateBusy {
+		c.rwm.Unlock()
+		return ErrPropertyStateBusy
+	}
+
 	if prop.Permissions == PropertyPermissionReadOnly {
+		c.rwm.Unlock()
 		return ErrPropertyReadOnly
 	}
 
 	_, ok = prop.Values[switchName]
 	if !ok {
+		c.rwm.Unlock()
 		return ErrPropertyValueNotFound
 	}
 
@@ -483,7 +658,7 @@ func (c *INDIClient) SetSwitchValue(deviceName, propName, switchName string, swi
 
 	device.SwitchProperties[propName] = prop
 
-	c.devices.Store(deviceName, device)
+	c.devices[deviceName] = device
 
 	cmd := NewSwitchVector{
 		Device: deviceName,
@@ -495,11 +670,22 @@ func (c *INDIClient) SetSwitchValue(deviceName, propName, switchName string, swi
 			},
 		},
 	}
-
+	c.rwm.Unlock()
+	fmt.Println("writing to channel")
 	c.write <- cmd
+	fmt.Println("waiting for response")
+	for {
+		c.rwm.RLock()
+		if c.devices[deviceName].SwitchProperties[propName].State == PropertyStateOk {
+			c.rwm.RUnlock()
+			break
+		}
+		c.rwm.RUnlock()
+	}
 
 	return nil
 }
+
 
 // SetBlobValue sends a command to the INDI server to change the value of a blobVector.
 func (c *INDIClient) SetBlobValue(deviceName, propName, blobName, blobValue, blobFormat string, blobSize int) error {
@@ -511,6 +697,10 @@ func (c *INDIClient) SetBlobValue(deviceName, propName, blobName, blobValue, blo
 	prop, ok := device.BlobProperties[propName]
 	if !ok {
 		return ErrPropertyNotFound
+	}
+
+	if prop.State == PropertyStateBusy {
+		return ErrPropertyStateBusy
 	}
 
 	if prop.Permissions == PropertyPermissionReadOnly {
@@ -526,8 +716,8 @@ func (c *INDIClient) SetBlobValue(deviceName, propName, blobName, blobValue, blo
 
 	device.BlobProperties[propName] = prop
 
-	c.devices.Store(deviceName, device)
-
+	c.devices[deviceName] = device
+	
 	cmd := NewBlobVector{
 		Device: deviceName,
 		Name:   propName,
@@ -542,18 +732,28 @@ func (c *INDIClient) SetBlobValue(deviceName, propName, blobName, blobValue, blo
 	}
 
 	c.write <- cmd
+	for {
+		c.rwm.RLock()
+		if c.devices[deviceName].BlobProperties[propName].State == PropertyStateOk {
+			c.rwm.RUnlock()
+			break
+		}
+		c.rwm.RUnlock()
+	}
 
 	return nil
 }
 
+// Reads INDIClient.devices. Only call when INDIClient.rwm is at least reader locked.
 func (c *INDIClient) findDevice(name string) (Device, error) {
-	if d, ok := c.devices.Load(name); ok {
-		return d.(Device), nil
+	if d, ok := c.devices[name]; ok {
+		return d, nil
 	}
 
 	return Device{}, ErrDeviceNotFound
 }
 
+// Reads INDIClient.devices. Only call when INDIClient.rwm is at least reader locked.
 func (c *INDIClient) findOrCreateDevice(name string) Device {
 	device, err := c.findDevice(name)
 	if err == ErrDeviceNotFound {
@@ -585,6 +785,8 @@ type indiMessageHandler interface {
 	delProperty(item *DelProperty)
 }
 
+
+// Modifies INDIClient.devices. Only call when INDIClient.rwm is locked.
 func (c *INDIClient) defTextVector(item *DefTextVector) {
 	device := c.findOrCreateDevice(item.Device)
 
@@ -616,9 +818,10 @@ func (c *INDIClient) defTextVector(item *DefTextVector) {
 
 	device.TextProperties[item.Name] = prop
 
-	c.devices.Store(item.Device, device)
+	c.devices[item.Device] = device
 }
 
+// Modifies INDIClient.devices. Only call when INDIClient.rwm is locked.
 func (c *INDIClient) defSwitchVector(item *DefSwitchVector) {
 	device := c.findOrCreateDevice(item.Device)
 
@@ -651,9 +854,10 @@ func (c *INDIClient) defSwitchVector(item *DefSwitchVector) {
 
 	device.SwitchProperties[item.Name] = prop
 
-	c.devices.Store(item.Device, device)
+	c.devices[item.Device] = device
 }
 
+// Modifies INDIClient.devices. Only call when INDIClient.rwm is locked.
 func (c *INDIClient) defNumberVector(item *DefNumberVector) {
 	device := c.findOrCreateDevice(item.Device)
 
@@ -689,9 +893,10 @@ func (c *INDIClient) defNumberVector(item *DefNumberVector) {
 
 	device.NumberProperties[item.Name] = prop
 
-	c.devices.Store(item.Device, device)
+	c.devices[item.Device] = device
 }
 
+// Modifies INDIClient.devices. Only call when INDIClient.rwm is locked.
 func (c *INDIClient) defLightVector(item *DefLightVector) {
 	device := c.findOrCreateDevice(item.Device)
 
@@ -722,9 +927,10 @@ func (c *INDIClient) defLightVector(item *DefLightVector) {
 
 	device.LightProperties[item.Name] = prop
 
-	c.devices.Store(item.Device, device)
+	c.devices[item.Device] = device
 }
 
+// Modifies INDIClient.devices. Only call when INDIClient.rwm is locked.
 func (c *INDIClient) defBlobVector(item *DefBlobVector) {
 	device := c.findOrCreateDevice(item.Device)
 
@@ -754,9 +960,10 @@ func (c *INDIClient) defBlobVector(item *DefBlobVector) {
 
 	device.BlobProperties[item.Name] = prop
 
-	c.devices.Store(item.Device, device)
+	c.devices[item.Device] = device
 }
 
+// Modifies INDIClient.devices. Only call when INDIClient.rwm is locked.
 func (c *INDIClient) setSwitchVector(item *SetSwitchVector) {
 	device, err := c.findDevice(item.Device)
 	if err != nil {
@@ -771,6 +978,8 @@ func (c *INDIClient) setSwitchVector(item *SetSwitchVector) {
 		c.log.WithField("device", item.Device).WithField("property", item.Name).Warn("could not find property")
 		return
 	}
+
+	fmt.Println(item.State)
 
 	prop.State = item.State
 	prop.Timeout = item.Timeout
@@ -807,9 +1016,10 @@ func (c *INDIClient) setSwitchVector(item *SetSwitchVector) {
 
 	device.SwitchProperties[item.Name] = prop
 
-	c.devices.Store(item.Device, device)
+	c.devices[item.Device] = device
 }
 
+// Modifies INDIClient.devices. Only call when INDIClient.rwm is locked.
 func (c *INDIClient) setTextVector(item *SetTextVector) {
 	device, err := c.findDevice(item.Device)
 	if err != nil {
@@ -860,9 +1070,10 @@ func (c *INDIClient) setTextVector(item *SetTextVector) {
 
 	device.TextProperties[item.Name] = prop
 
-	c.devices.Store(item.Device, device)
+	c.devices[item.Device] = device
 }
 
+// Modifies INDIClient.devices. Only call when INDIClient.rwm is locked.
 func (c *INDIClient) setNumberVector(item *SetNumberVector) {
 	device, err := c.findDevice(item.Device)
 	if err != nil {
@@ -913,9 +1124,10 @@ func (c *INDIClient) setNumberVector(item *SetNumberVector) {
 
 	device.NumberProperties[item.Name] = prop
 
-	c.devices.Store(item.Device, device)
+	c.devices[item.Device] = device
 }
 
+// Modifies INDIClient.devices. Only call when INDIClient.rwm is locked.
 func (c *INDIClient) setLightVector(item *SetLightVector) {
 	device, err := c.findDevice(item.Device)
 	if err != nil {
@@ -965,9 +1177,11 @@ func (c *INDIClient) setLightVector(item *SetLightVector) {
 
 	device.LightProperties[item.Name] = prop
 
-	c.devices.Store(item.Device, device)
+	c.devices[item.Device] = device
 }
 
+
+// Modifies INDIClient.devices. Only call when INDIClient.rwm is locked.
 func (c *INDIClient) setBlobVector(item *SetBlobVector) {
 	device, err := c.findDevice(item.Device)
 	if err != nil {
@@ -1052,7 +1266,7 @@ func (c *INDIClient) setBlobVector(item *SetBlobVector) {
 
 	device.BlobProperties[item.Name] = prop
 
-	c.devices.Store(item.Device, device)
+	c.devices[item.Device] = device
 }
 
 func (c *INDIClient) message(item *Message) {
@@ -1067,21 +1281,21 @@ func (c *INDIClient) message(item *Message) {
 		Timestamp: time.Now(),
 	})
 
-	c.devices.Store(item.Device, device)
+	c.devices[item.Device] = device
 }
 
+// Modifies INDIClient.devices must only be called in locked environment
 func (c *INDIClient) delProperty(item *DelProperty) {
 	if len(item.Device) == 0 {
-		c.devices.Range(func(key, value interface{}) bool {
-			c.devices.Delete(key)
-			return true
-		})
-
+		for key, _ := range c.devices {
+			delete(c.devices, key)
+			return
+		}
 		return
 	}
 
 	if len(item.Name) == 0 {
-		c.devices.Delete(item.Device)
+		delete(c.devices, item.Device)
 		return
 	}
 
@@ -1093,14 +1307,15 @@ func (c *INDIClient) delProperty(item *DelProperty) {
 	delete(device.LightProperties, item.Name)
 	delete(device.BlobProperties, item.Name)
 
-	c.devices.Store(item.Device, device)
+	c.devices[item.Device] = device
 }
 
 func (c *INDIClient) startRead() {
-	go func(r <-chan interface{}, log logging.Logger, handler indiMessageHandler) {
+	go func(r <-chan interface{}, log logging.Logger, lock *sync.RWMutex, handler indiMessageHandler) {
 		for i := range r {
 			log.WithField("item", i).Debug("got message")
 
+			lock.Lock()
 			switch item := i.(type) {
 			case *DefTextVector:
 				handler.defTextVector(item)
@@ -1129,8 +1344,9 @@ func (c *INDIClient) startRead() {
 			default:
 				log.WithField("type", fmt.Sprintf("%T", item)).Warn("unknown type")
 			}
+			lock.Unlock()
 		}
-	}(c.read, c.log, c)
+	}(c.read, c.log, c.rwm, c)
 
 	go func(conn io.Reader, r chan<- interface{}, log logging.Logger) {
 		decoder := xml.NewDecoder(conn)
@@ -1209,11 +1425,13 @@ func (c *INDIClient) startRead() {
 }
 
 func (c *INDIClient) startWrite() {
-	go func(conn io.Writer, w <-chan interface{}, log logging.Logger) {
+	go func(conn io.Writer, w chan interface{}, log logging.Logger, lock *sync.RWMutex, handler indiMessageHandler) {
 		for item := range w {
+			lock.Lock()
 			b, err := xml.Marshal(item)
 			if err != nil {
 				log.WithError(err).Error("error in xml.Marshal")
+				lock.Unlock()
 				continue
 			}
 
@@ -1222,8 +1440,10 @@ func (c *INDIClient) startWrite() {
 			_, err = conn.Write(b)
 			if err != nil {
 				log.WithError(err).Error("error in conn.Write")
+				lock.Unlock()
 				continue
 			}
+			lock.Unlock()
 		}
-	}(c.conn, c.write, c.log)
+	}(c.conn, c.write, c.log, c.rwm, c)
 }
