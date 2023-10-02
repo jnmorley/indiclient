@@ -227,9 +227,7 @@ func (c *INDIClient) Devices() []string {
 
 	for key, _ := range c.devices {
 		devices = append(devices, key)
-		return devices
 	}
-
 	return devices
 }
 
@@ -271,6 +269,10 @@ func (c *INDIClient) GetBlob(deviceName, propName, blobName string) (rdr io.Read
 	// This method should only work once per blob, so the blob value and size are reset
 	val.Value = ""
 	val.Size = 0
+
+	device.BlobProperties[propName] = prop
+	
+	c.devices[deviceName] = device
 	return
 }
 
@@ -418,22 +420,17 @@ func (c *INDIClient) TextPropertySet(deviceName, propName string) bool {
 }
 
 func (c *INDIClient) NumberPropertySet(deviceName, propName string) bool {
-	fmt.Println("before lock")
 	c.rwm.RLock()
 	defer c.rwm.RUnlock()
-	fmt.Println("lock aquired")
 	device, err := c.findDevice(deviceName)
 	if err != nil {
-		fmt.Println("no device")
 		return false
 	}
 
 	_, ok := device.NumberProperties[propName]
 	if !ok {
-		fmt.Println("no prop")
 		return false
 	}
-	fmt.Println("made it through")
 	return true
 }
 
@@ -608,7 +605,7 @@ func (c *INDIClient) SetNumberValue(deviceName, propName, numberName, numberValu
 	}
 	c.rwm.Unlock()
 	c.write <- cmd
-
+	
 	for {
 		c.rwm.RLock()
 		if c.devices[deviceName].NumberProperties[propName].State == PropertyStateOk {
@@ -626,7 +623,6 @@ func (c *INDIClient) SetNumberValue(deviceName, propName, numberName, numberValu
 // decide how to switch the other values off.
 func (c *INDIClient) SetSwitchValue(deviceName, propName, switchName string, switchValue SwitchState) error {
 	c.rwm.Lock()
-	fmt.Println("lock aquired")
 	device, err := c.findDevice(deviceName)
 	if err != nil {
 		return err
@@ -671,9 +667,8 @@ func (c *INDIClient) SetSwitchValue(deviceName, propName, switchName string, swi
 		},
 	}
 	c.rwm.Unlock()
-	fmt.Println("writing to channel")
 	c.write <- cmd
-	fmt.Println("waiting for response")
+	
 	for {
 		c.rwm.RLock()
 		if c.devices[deviceName].SwitchProperties[propName].State == PropertyStateOk {
@@ -689,26 +684,32 @@ func (c *INDIClient) SetSwitchValue(deviceName, propName, switchName string, swi
 
 // SetBlobValue sends a command to the INDI server to change the value of a blobVector.
 func (c *INDIClient) SetBlobValue(deviceName, propName, blobName, blobValue, blobFormat string, blobSize int) error {
+	c.rwm.Lock()
 	device, err := c.findDevice(deviceName)
 	if err != nil {
+		c.rwm.Unlock()
 		return err
 	}
 
 	prop, ok := device.BlobProperties[propName]
 	if !ok {
+		c.rwm.Unlock()
 		return ErrPropertyNotFound
 	}
 
 	if prop.State == PropertyStateBusy {
+		c.rwm.Unlock()
 		return ErrPropertyStateBusy
 	}
 
 	if prop.Permissions == PropertyPermissionReadOnly {
+		c.rwm.Unlock()
 		return ErrPropertyReadOnly
 	}
 
 	_, ok = prop.Values[blobName]
 	if !ok {
+		c.rwm.Unlock()
 		return ErrPropertyValueNotFound
 	}
 
@@ -731,6 +732,7 @@ func (c *INDIClient) SetBlobValue(deviceName, propName, blobName, blobValue, blo
 		},
 	}
 
+	c.rwm.Unlock()
 	c.write <- cmd
 	for {
 		c.rwm.RLock()
@@ -978,8 +980,6 @@ func (c *INDIClient) setSwitchVector(item *SetSwitchVector) {
 		c.log.WithField("device", item.Device).WithField("property", item.Name).Warn("could not find property")
 		return
 	}
-
-	fmt.Println(item.State)
 
 	prop.State = item.State
 	prop.Timeout = item.Timeout
