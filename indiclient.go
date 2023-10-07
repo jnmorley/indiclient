@@ -402,6 +402,7 @@ func (c *INDIClient) GetProperties(deviceName, propName string) error {
 	return nil
 }
 
+// Probes the client to check if a text property is set
 func (c *INDIClient) TextPropertySet(deviceName, propName string) bool {
 	c.rwm.RLock()
 	defer c.rwm.RUnlock()
@@ -419,6 +420,7 @@ func (c *INDIClient) TextPropertySet(deviceName, propName string) bool {
 	
 }
 
+// Probes the client to check if a number property is set
 func (c *INDIClient) NumberPropertySet(deviceName, propName string) bool {
 	c.rwm.RLock()
 	defer c.rwm.RUnlock()
@@ -434,6 +436,7 @@ func (c *INDIClient) NumberPropertySet(deviceName, propName string) bool {
 	return true
 }
 
+// Probes the client to check if a switch property is set
 func (c *INDIClient) SwitchPropertySet(deviceName, propName string) bool {
 	c.rwm.RLock()
 	defer c.rwm.RUnlock()
@@ -450,6 +453,7 @@ func (c *INDIClient) SwitchPropertySet(deviceName, propName string) bool {
 	return true
 }
 
+// Probes the client to check if a blob property is set
 func (c *INDIClient) BlobPropertySet(deviceName, propName string) bool {
 	c.rwm.RLock()
 	defer c.rwm.RUnlock()
@@ -464,6 +468,69 @@ func (c *INDIClient) BlobPropertySet(deviceName, propName string) bool {
 	}
 
 	return true
+}
+
+// GetText finds a TextValue with the given deviceName, propName, TextName.
+func (c *INDIClient) GetText(deviceName, propName, textName string) (TextValue, error){
+	c.rwm.RLock()
+	defer c.rwm.RUnlock()
+	device, err := c.findDevice(deviceName)
+	if err != nil {
+		return TextValue{}, ErrDeviceNotFound
+	}
+
+	prop, ok := device.TextProperties[propName]
+	if !ok {
+		return TextValue{}, ErrPropertyNotFound
+	}
+
+	if val, ok := prop.Values[textName]; ok {
+		return val, nil
+	}
+
+	return TextValue{}, ErrPropertyValueNotFound
+}
+
+// GetNumber finds a NumberValue with the given deviceName, propName, NumberName.
+func (c *INDIClient) GetNumber(deviceName, propName, numberName string) (NumberValue, error){
+	c.rwm.RLock()
+	defer c.rwm.RUnlock()
+	device, err := c.findDevice(deviceName)
+	if err != nil {
+		return NumberValue{}, ErrDeviceNotFound
+	}
+
+	prop, ok := device.NumberProperties[propName]
+	if !ok {
+		return NumberValue{}, ErrPropertyNotFound
+	}
+
+	if val, ok := prop.Values[numberName]; ok {
+		return val, nil
+	}
+
+	return NumberValue{}, ErrPropertyValueNotFound
+}
+
+// GetSwitch finds a SwitchValue with the given deviceName, propName, SwitchName.
+func (c *INDIClient) GetSwitch(deviceName, propName, switchName string) (SwitchValue, error){
+	c.rwm.RLock()
+	defer c.rwm.RUnlock()
+	device, err := c.findDevice(deviceName)
+	if err != nil {
+		return SwitchValue{}, ErrDeviceNotFound
+	}
+
+	prop, ok := device.SwitchProperties[propName]
+	if !ok {
+		return SwitchValue{}, ErrPropertyNotFound
+	}
+
+	if val, ok := prop.Values[switchName]; ok {
+		return val, nil
+	}
+
+	return SwitchValue{}, ErrPropertyValueNotFound
 }
 
 // EnableBlob sends a command to the INDI server to enable/disable BLOBs for the current connection.
@@ -492,7 +559,10 @@ func (c *INDIClient) EnableBlob(deviceName, propName string, val BlobEnable) err
 
 // SetTextValue sends a command to the INDI server to change the value of a textVector.
 // Waits to return until the state of the vector is ok.
-func (c *INDIClient) SetTextValue(deviceName, propName, textName, textValue string) error {
+func (c *INDIClient) SetTextValue(deviceName, propName string, textNames, textValues []string) error {
+	if len(textNames) != len(textValues) {
+		return errors.New("len(textNames) must be equal to len(textValues)")
+	}
 	c.rwm.Lock()
 	device, err := c.findDevice(deviceName)
 	if err != nil {
@@ -516,10 +586,12 @@ func (c *INDIClient) SetTextValue(deviceName, propName, textName, textValue stri
 		return ErrPropertyReadOnly
 	}
 
-	_, ok = prop.Values[textName]
-	if !ok {
-		c.rwm.Unlock()
-		return ErrPropertyValueNotFound
+	for _, textName := range textNames {
+		_, ok = prop.Values[textName]
+		if !ok {
+			c.rwm.Unlock()
+			return ErrPropertyValueNotFound
+		}
 	}
 
 	prop.State = PropertyStateBusy
@@ -528,36 +600,45 @@ func (c *INDIClient) SetTextValue(deviceName, propName, textName, textValue stri
 
 	c.devices[deviceName] = device
 
+	texts := []OneText{}
+	for index, name := range textNames {
+		texts = append(texts, OneText{
+			Name: name,
+			Value: textValues[index],
+		})
+	}
+
 	cmd := NewTextVector{
 		Device: deviceName,
 		Name:   propName,
-		Texts: []OneText{
-			{
-				Name:  textName,
-				Value: textValue,
-			},
-		},
+		Texts: texts,
 	}
 
 	c.rwm.Unlock()
 
 	c.write <- cmd
 	
+	var state PropertyState
 	for {
 		c.rwm.RLock()
-		if c.devices[deviceName].TextProperties[propName].State == PropertyStateOk {
-			c.rwm.RUnlock()
+		state = c.devices[deviceName].TextProperties[propName].State
+		c.rwm.RUnlock()
+		if state == PropertyStateOk {
 			break
 		}
-		c.rwm.RUnlock()
-		
+		if state == PropertyStateAlert {
+			return errors.New("Unable to set text property: " + prop.Name)
+		}
 	}
 
 	return nil
 }
 
 // SetNumberValue sends a command to the INDI server to change the value of a numberVector.
-func (c *INDIClient) SetNumberValue(deviceName, propName, numberName, numberValue string) error {
+func (c *INDIClient) SetNumberValue(deviceName, propName string, numberNames, numberValues []string) error {
+	if len(numberNames) != len(numberValues) {
+		return errors.New("len(numberNames) must be equal to len(numberValues)")
+	}
 	c.rwm.Lock()
 	device, err := c.findDevice(deviceName)
 	if err != nil {
@@ -580,11 +661,12 @@ func (c *INDIClient) SetNumberValue(deviceName, propName, numberName, numberValu
 		c.rwm.Unlock()
 		return ErrPropertyReadOnly
 	}
-
-	_, ok = prop.Values[numberName]
-	if !ok {
-		c.rwm.Unlock()
-		return ErrPropertyValueNotFound
+	for _, numberName := range numberNames {
+		_, ok = prop.Values[numberName]
+		if !ok {
+			c.rwm.Unlock()
+			return ErrPropertyValueNotFound
+		}
 	}
 
 	prop.State = PropertyStateBusy
@@ -592,27 +674,33 @@ func (c *INDIClient) SetNumberValue(deviceName, propName, numberName, numberValu
 	device.NumberProperties[propName] = prop
 
 	c.devices[deviceName] = device
+
+	numbers := []OneNumber{}
+	for index, name := range numberNames {
+		numbers = append(numbers, OneNumber{
+			Name: name,
+			Value: numberValues[index],
+		})
+	}
 	
 	cmd := NewNumberVector{
 		Device: deviceName,
 		Name:   propName,
-		Numbers: []OneNumber{
-			{
-				Name:  numberName,
-				Value: numberValue,
-			},
-		},
+		Numbers: numbers,
 	}
 	c.rwm.Unlock()
 	c.write <- cmd
-	
+	var state PropertyState
 	for {
 		c.rwm.RLock()
-		if c.devices[deviceName].NumberProperties[propName].State == PropertyStateOk {
-			c.rwm.RUnlock()
+		state = c.devices[deviceName].NumberProperties[propName].State
+		c.rwm.RUnlock()
+		if state == PropertyStateOk {
 			break
 		}
-		c.rwm.RUnlock()
+		if state == PropertyStateAlert {
+			return errors.New("Unable to set number property: " + prop.Name)
+		}
 	}
 
 	return nil
@@ -621,7 +709,10 @@ func (c *INDIClient) SetNumberValue(deviceName, propName, numberName, numberValu
 // SetSwitchValue sends a command to the INDI server to change the value of a switchVector.
 // Note that you will ususally set the desired property on SwitchStateOn, and let the device
 // decide how to switch the other values off.
-func (c *INDIClient) SetSwitchValue(deviceName, propName, switchName string, switchValue SwitchState) error {
+func (c *INDIClient) SetSwitchValue(deviceName, propName string, switchNames []string, switchValues []SwitchState) error {
+	if len(switchNames) != len(switchValues) {
+		return errors.New("len(switchNames) must be equal to len(switchValues)")
+	}
 	c.rwm.Lock()
 	device, err := c.findDevice(deviceName)
 	if err != nil {
@@ -644,10 +735,12 @@ func (c *INDIClient) SetSwitchValue(deviceName, propName, switchName string, swi
 		return ErrPropertyReadOnly
 	}
 
-	_, ok = prop.Values[switchName]
-	if !ok {
-		c.rwm.Unlock()
-		return ErrPropertyValueNotFound
+	for _, switchName := range switchNames {
+		_, ok = prop.Values[switchName]
+		if !ok {
+			c.rwm.Unlock()
+			return ErrPropertyValueNotFound
+		}
 	}
 
 	prop.State = PropertyStateBusy
@@ -656,26 +749,32 @@ func (c *INDIClient) SetSwitchValue(deviceName, propName, switchName string, swi
 
 	c.devices[deviceName] = device
 
+	switches := []OneSwitch{}
+	for index, name := range switchNames {
+		switches = append(switches, OneSwitch{
+			Name: name,
+			Value: switchValues[index],
+		})
+	}
 	cmd := NewSwitchVector{
 		Device: deviceName,
 		Name:   propName,
-		Switches: []OneSwitch{
-			{
-				Name:  switchName,
-				Value: switchValue,
-			},
-		},
+		Switches: switches,
 	}
 	c.rwm.Unlock()
 	c.write <- cmd
-	
+
+	var state PropertyState
 	for {
 		c.rwm.RLock()
-		if c.devices[deviceName].SwitchProperties[propName].State == PropertyStateOk {
-			c.rwm.RUnlock()
+		state = c.devices[deviceName].SwitchProperties[propName].State
+		c.rwm.RUnlock()
+		if state == PropertyStateOk {
 			break
 		}
-		c.rwm.RUnlock()
+		if state == PropertyStateAlert {
+			return errors.New("unable to set switch property: " + prop.Name)
+		}
 	}
 
 	return nil
@@ -734,13 +833,18 @@ func (c *INDIClient) SetBlobValue(deviceName, propName, blobName, blobValue, blo
 
 	c.rwm.Unlock()
 	c.write <- cmd
+
+	var state PropertyState
 	for {
 		c.rwm.RLock()
-		if c.devices[deviceName].BlobProperties[propName].State == PropertyStateOk {
-			c.rwm.RUnlock()
+		state = c.devices[deviceName].BlobProperties[propName].State
+		c.rwm.RUnlock()
+		if state == PropertyStateOk {
 			break
 		}
-		c.rwm.RUnlock()
+		if state == PropertyStateAlert {
+			return errors.New("unable to set blob property: " + prop.Name)
+		}
 	}
 
 	return nil
@@ -1116,6 +1220,7 @@ func (c *INDIClient) setNumberVector(item *SetNumberVector) {
 	}
 
 	if len(item.Message) > 0 {
+		fmt.Println(item.Message)
 		prop.Messages = append(prop.Messages, MessageJSON{
 			Message:   item.Message,
 			Timestamp: time.Now(),
@@ -1436,7 +1541,6 @@ func (c *INDIClient) startWrite() {
 			}
 
 			log.WithField("cmd", string(b)).Debug("sending command")
-
 			_, err = conn.Write(b)
 			if err != nil {
 				log.WithError(err).Error("error in conn.Write")
